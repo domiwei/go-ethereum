@@ -264,13 +264,8 @@ func (l *StateDiffTracer) report(addr common.Address, a accountDiff) accountRepo
 		}
 	}
 	for k, v := range a.storage {
-		before, after := "", ""
-		if v.before != (common.Hash{}) {
-			before = v.before.Hex()
-		}
-		if v.after != (common.Hash{}) {
-			after = v.after.Hex()
-		}
+		before := v.before.Hex()
+		after := v.after.Hex()
 		if before != after {
 			result.Storage[k.Hex()] = fromTo{
 				From: before,
