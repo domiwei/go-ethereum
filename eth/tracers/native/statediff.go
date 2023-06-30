@@ -1,11 +1,12 @@
 package native
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 )
@@ -30,7 +31,6 @@ type accountDiff struct {
 type StateDiffTracer struct {
 	accounts map[common.Address]accountDiff
 	env      *vm.EVM
-	gasLimit uint64
 	tracer   *callTracer
 }
 
@@ -45,18 +45,7 @@ func newStateTracer(ctx *tracers.Context, cfg json.RawMessage) (tracers.Tracer, 
 	}, nil
 }
 
-// transferFunc
-func (l *StateDiffTracer) WrappedTransferFunc(db vm.StateDB, sender, recipient common.Address, amount *big.Int) {
-	defer func() {
-		// record the balance change
-		l.recordBalanceChange(sender, big.NewInt(0).Neg(amount))
-		l.recordBalanceChange(recipient, amount)
-	}()
-	core.Transfer(db, sender, recipient, amount)
-}
-
 func (l *StateDiffTracer) CaptureTxStart(gasLimit uint64) {
-	l.gasLimit = gasLimit
 	l.tracer.CaptureTxStart(gasLimit)
 }
 
@@ -82,10 +71,22 @@ func (l *StateDiffTracer) CaptureEnd(output []byte, gasUsed uint64, err error) {
 	// record gas used
 	l.recordBalanceChange(callframe.From, big.NewInt(0).Neg(big.NewInt(int64(gasUsed))))
 
-	if callframe.Type == vm.CREATE || callframe.Type == vm.CREATE2 {
-		// record the code
-		contract := *callframe.To
-		l.recordCode(contract, l.env.StateDB.GetCode(contract))
+	opType := callframe.Type
+	switch opType {
+	case vm.CREATE, vm.CREATE2, vm.CALL:
+		if opType == vm.CREATE || opType == vm.CREATE2 {
+			// record the code
+			contract := *callframe.To
+			l.recordCode(contract, l.env.StateDB.GetCode(contract))
+		}
+		// ether transfer
+		value := callframe.Value
+		if value != nil {
+			from := callframe.From
+			to := *callframe.To
+			l.recordBalanceChange(from, big.NewInt(0).Neg(value))
+			l.recordBalanceChange(to, value)
+		}
 	}
 }
 
@@ -105,11 +106,22 @@ func (l *StateDiffTracer) CaptureExit(output []byte, gasUsed uint64, err error) 
 	// record gas used
 	l.recordBalanceChange(callframe.From, big.NewInt(0).Neg(big.NewInt(int64(gasUsed))))
 
-	switch callframe.Type {
-	case vm.CREATE, vm.CREATE2:
-		// record the code
-		contract := *callframe.To
-		l.recordCode(contract, callframe.Input)
+	opType := callframe.Type
+	switch opType {
+	case vm.CREATE, vm.CREATE2, vm.CALL:
+		if opType == vm.CREATE || opType == vm.CREATE2 {
+			// record the code
+			contract := *callframe.To
+			l.recordCode(contract, callframe.Input)
+		}
+		// ether transfer
+		value := callframe.Value
+		if value != nil {
+			from := callframe.From
+			to := *callframe.To
+			l.recordBalanceChange(from, big.NewInt(0).Neg(value))
+			l.recordBalanceChange(to, value)
+		}
 	case vm.SELFDESTRUCT:
 		// destruct this contract. code is empty and balance is zero
 		contract := *callframe.To
@@ -136,11 +148,15 @@ func (l *StateDiffTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64
 }
 
 func (l *StateDiffTracer) GetResult() (json.RawMessage, error) {
-	return nil, nil
+	result := map[string]accountReport{}
+	for addr, diff := range l.accounts {
+		result[addr.Hex()] = l.report(addr, diff)
+	}
+	return json.Marshal(result)
 }
 
 func (l *StateDiffTracer) Stop(err error) {
-
+	l.tracer.Stop(err)
 }
 
 func (l *StateDiffTracer) tryInitAccDiff(addr common.Address) bool {
@@ -195,4 +211,72 @@ func (l *StateDiffTracer) recordBalanceChange(addr common.Address, delta *big.In
 	diff := l.accounts[addr]
 	diff.balanceDelta.Add(diff.balanceDelta, delta)
 	l.accounts[addr] = diff
+}
+
+type accountReport struct {
+	Balance any               `json:"balance"`
+	Nonce   any               `json:"nonce"`
+	Code    any               `json:"code"`
+	Storage map[string]fromTo `json:"storage"`
+}
+type fromTo struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+func (l *StateDiffTracer) report(addr common.Address, a accountDiff) accountReport {
+	result := accountReport{
+		Balance: "=",
+		Nonce:   "=",
+		Code:    "=",
+		Storage: make(map[string]fromTo),
+	}
+	if a.balanceDelta != nil && a.balanceDelta.Sign() != 0 {
+		delta := a.balanceDelta
+		current := l.env.StateDB.GetBalance(addr)
+		result.Balance = fromTo{
+			// from = current - delta. transform to hex
+			From: fmt.Sprintf("0x%x", current.Sub(current, delta)),
+			To:   fmt.Sprintf("0x%x", current),
+		}
+	}
+	if a.nonceDelta != 0 {
+		current := l.env.StateDB.GetNonce(addr)
+		result.Nonce = fromTo{
+			// in hex
+			From: fmt.Sprintf("0x%x", current-uint64(a.nonceDelta)),
+			To:   fmt.Sprintf("0x%x", current),
+		}
+	}
+	if a.code.before != nil || a.code.after != nil {
+		before, after := "", ""
+		if a.code.before != nil {
+			before = hex.EncodeToString(a.code.before)
+		}
+		if a.code.after != nil {
+			after = hex.EncodeToString(a.code.after)
+		}
+		if before != after {
+			result.Code = fromTo{
+				From: before,
+				To:   after,
+			}
+		}
+	}
+	for k, v := range a.storage {
+		before, after := "", ""
+		if v.before != (common.Hash{}) {
+			before = v.before.Hex()
+		}
+		if v.after != (common.Hash{}) {
+			after = v.after.Hex()
+		}
+		if before != after {
+			result.Storage[k.Hex()] = fromTo{
+				From: before,
+				To:   after,
+			}
+		}
+	}
+	return result
 }
