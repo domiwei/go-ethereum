@@ -905,68 +905,17 @@ func (api *API) TraceCallMany(ctx context.Context, args []ethapi.TransactionArgs
 
 	result := []interface{}{}
 	for _, arg := range args {
-		msg, err := arg.ToMessage(api.backend.RPCGasCap(), block.Header().Number)
+		msg, err := arg.ToMessage(api.backend.RPCGasCap(), block.BaseFee())
 		if err != nil {
 			return nil, err
 		}
-		txctx := &Context{
-			BlockHash:   block.Hash(),
-			BlockNumber: block.Number(),
-			TxIndex:     -1,
-			TxHash:      common.Hash{},
-		}
-		res, err := api.traceStateDiffTx(ctx, msg, txctx, vmctx, statedb, traceConfig)
+		res, err := api.traceTx(ctx, msg, new(Context), vmctx, statedb, traceConfig)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, res)
 	}
 	return result, nil
-}
-
-func (api *API) traceStateDiffTx(ctx context.Context, message *core.Message, txctx *Context, vmctx vm.BlockContext, statedb *state.StateDB, config *TraceConfig) (interface{}, error) {
-	var (
-		tracer    Tracer
-		err       error
-		timeout   = defaultTraceTimeout
-		txContext = core.NewEVMTxContext(message)
-	)
-	if config == nil {
-		config = &TraceConfig{}
-	}
-	// Default tracer is the struct logger
-	tracer = logger.NewStructLogger(config.Config)
-	if config.Tracer != nil {
-		tracer, err = DefaultDirectory.New(*config.Tracer, txctx, config.TracerConfig)
-		if err != nil {
-			return nil, err
-		}
-	}
-	vmenv := vm.NewEVM(vmctx, txContext, statedb, api.backend.ChainConfig(), vm.Config{Tracer: tracer, NoBaseFee: true})
-
-	// Define a meaningful timeout of a single transaction trace
-	if config.Timeout != nil {
-		if timeout, err = time.ParseDuration(*config.Timeout); err != nil {
-			return nil, err
-		}
-	}
-	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
-	go func() {
-		<-deadlineCtx.Done()
-		if errors.Is(deadlineCtx.Err(), context.DeadlineExceeded) {
-			tracer.Stop(errors.New("execution timeout"))
-			// Stop evm execution. Note cancellation is not necessarily immediate.
-			vmenv.Cancel()
-		}
-	}()
-	defer cancel()
-
-	// Call Prepare to clear out the statedb access list
-	statedb.SetTxContext(txctx.TxHash, txctx.TxIndex)
-	if _, err = core.ApplyMessage(vmenv, message, new(core.GasPool).AddGas(message.GasLimit)); err != nil {
-		return nil, fmt.Errorf("tracing failed: %w", err)
-	}
-	return tracer.GetResult()
 }
 
 // TraceCall lets you trace a given eth_call. It collects the structured logs
@@ -1020,7 +969,6 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 	if err != nil {
 		return nil, err
 	}
-
 	var traceConfig *TraceConfig
 	if config != nil {
 		traceConfig = &config.TraceConfig
