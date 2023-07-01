@@ -861,7 +861,7 @@ func (api *API) TraceTransaction(ctx context.Context, hash common.Hash, config *
 	return api.traceTx(ctx, msg, txctx, vmctx, statedb, config)
 }
 
-func (api *API) TraceCallMany(ctx context.Context, args []ethapi.TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) (interface{}, error) {
+func (api *API) TraceCallMany(ctx context.Context, args []ethapi.TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) ([]interface{}, error) {
 	// Try to retrieve the specified block
 	var (
 		err   error
@@ -903,6 +903,7 @@ func (api *API) TraceCallMany(ctx context.Context, args []ethapi.TransactionArgs
 		traceConfig = &config.TraceConfig
 	}
 
+	// loop over all the transactions and trace internal calls
 	result := []interface{}{}
 	for _, arg := range args {
 		msg, err := arg.ToMessage(api.backend.RPCGasCap(), block.BaseFee())
