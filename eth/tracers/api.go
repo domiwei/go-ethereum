@@ -914,6 +914,7 @@ func (api *API) TraceCallMany(ctx context.Context, args []ethapi.TransactionArgs
 		if err != nil {
 			return nil, err
 		}
+		// append all results
 		result = append(result, res)
 	}
 	return result, nil

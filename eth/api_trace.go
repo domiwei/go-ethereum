@@ -40,9 +40,7 @@ func (api *TraceAPI) CallMany(ctx context.Context, txs []ethapi.TransactionArgs)
 	}
 	result := map[string]interface{}{
 		"blockNumber": latestBlockNumOrHash.BlockNumber.String(),
-		"trace": map[string]interface{}{
-			"stateDiff": traceResult,
-		},
+		"traceResult": traceResult,
 	}
 	return result, nil
 }

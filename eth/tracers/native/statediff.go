@@ -51,9 +51,15 @@ func (l *StateDiffTracer) CaptureTxStart(gasLimit uint64) {
 
 func (l *StateDiffTracer) CaptureTxEnd(restGas uint64) {
 	l.tracer.CaptureTxEnd(restGas)
-	caller := l.tracer.callstack[0].From
-	used := l.tracer.callstack[0].GasUsed
+	callFrame := l.tracer.callstack[0]
+	caller := callFrame.From
+	used := callFrame.GasUsed
+	// record gas used here instead of capture whenever gas is used, because need to consider intrinsic gas
 	l.recordBalanceChange(caller, big.NewInt(-int64(used)))
+	// additional nonce increment when first call is not CREATE
+	if callFrame.Type != vm.CREATE {
+		l.recordNonceIncrese(caller)
+	}
 }
 
 func (l *StateDiffTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Address, create bool, input []byte, gas uint64, value *big.Int) {
@@ -68,8 +74,7 @@ func (l *StateDiffTracer) CaptureStart(env *vm.EVM, from common.Address, to comm
 func (l *StateDiffTracer) CaptureEnd(output []byte, gasUsed uint64, err error) {
 	l.tracer.CaptureEnd(output, gasUsed, err)
 	callframe := l.tracer.callstack[0]
-	// record gas used
-	l.recordBalanceChange(callframe.From, big.NewInt(0).Neg(big.NewInt(int64(gasUsed))))
+	// Note: do not record gasUsed here. All gas used value is recorded in TxEnd
 
 	opType := callframe.Type
 	switch opType {
@@ -103,8 +108,7 @@ func (l *StateDiffTracer) CaptureExit(output []byte, gasUsed uint64, err error) 
 	// retrieve the last callframe in last callstack
 	lastCallStack := l.tracer.callstack[len(l.tracer.callstack)-1].Calls
 	callframe := lastCallStack[len(lastCallStack)-1]
-	// record gas used
-	l.recordBalanceChange(callframe.From, big.NewInt(0).Neg(big.NewInt(int64(gasUsed))))
+	// Note: do not record gasUsed here. All gas used value is recorded in TxEnd
 
 	opType := callframe.Type
 	switch opType {
@@ -142,15 +146,20 @@ func (l *StateDiffTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64
 		if stackLen >= 2 {
 			value := common.Hash(stack.Data()[stackLen-2].Bytes32())
 			address := common.Hash(stack.Data()[stackLen-1].Bytes32())
+			// record storage change
 			l.recordStorage(contract.Address(), address, value)
 		}
 	}
 }
 
 func (l *StateDiffTracer) GetResult() (json.RawMessage, error) {
-	result := map[string]accountReport{}
+	stateDiffResult := map[string]accountReport{}
 	for addr, diff := range l.accounts {
-		result[addr.Hex()] = l.report(addr, diff)
+		stateDiffResult[addr.Hex()] = l.report(addr, diff)
+	}
+	result := map[string]interface{}{
+		// only stateDiff result is supported now
+		"stateDiff": stateDiffResult,
 	}
 	return json.Marshal(result)
 }
@@ -231,15 +240,17 @@ func (l *StateDiffTracer) report(addr common.Address, a accountDiff) accountRepo
 		Code:    "=",
 		Storage: make(map[string]fromTo),
 	}
+	// balance
 	if a.balanceDelta != nil && a.balanceDelta.Sign() != 0 {
 		delta := a.balanceDelta
 		current := l.env.StateDB.GetBalance(addr)
 		result.Balance = fromTo{
 			// from = current - delta. transform to hex
-			From: fmt.Sprintf("0x%x", current.Sub(current, delta)),
-			To:   fmt.Sprintf("0x%x", current),
+			From: fmt.Sprintf("0x%x", big.NewInt(0).Sub(current, delta).Text(16)),
+			To:   fmt.Sprintf("0x%x", current.Text(16)),
 		}
 	}
+	// nonce
 	if a.nonceDelta != 0 {
 		current := l.env.StateDB.GetNonce(addr)
 		result.Nonce = fromTo{
@@ -248,6 +259,7 @@ func (l *StateDiffTracer) report(addr common.Address, a accountDiff) accountRepo
 			To:   fmt.Sprintf("0x%x", current),
 		}
 	}
+	// code
 	if a.code.before != nil || a.code.after != nil {
 		before, after := "", ""
 		if a.code.before != nil {
@@ -263,6 +275,7 @@ func (l *StateDiffTracer) report(addr common.Address, a accountDiff) accountRepo
 			}
 		}
 	}
+	// storage
 	for k, v := range a.storage {
 		before := v.before.Hex()
 		after := v.after.Hex()
